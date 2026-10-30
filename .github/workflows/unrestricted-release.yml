@@ -120,10 +120,13 @@ jobs:
 
       - name: 产物自检
         shell: bash
+        env:
+          PYTHONIOENCODING: utf-8
         run: |
           set -euo pipefail
           python - <<'PY'
           import pathlib, sys
+          sys.stdout.reconfigure(encoding="utf-8", errors="replace")
           marker = "region-policy-disabled".encode("utf-16-le")
           exes = sorted(pathlib.Path("dist").glob("*.exe"))
           if not exes:

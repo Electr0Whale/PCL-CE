@@ -118,6 +118,23 @@ jobs:
           ls -lh dist
           cat dist/SHA256SUMS.txt
 
+      - name: 产物自检
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import pathlib, sys
+          marker = "region-policy-disabled".encode("utf-16-le")
+          exes = sorted(pathlib.Path("dist").glob("*.exe"))
+          if not exes:
+              print("::error::dist 目录没有产物"); sys.exit(1)
+          bad = [p.name for p in exes if marker not in p.read_bytes()]
+          print("checked:", ", ".join(p.name for p in exes))
+          if bad:
+              print("::error::产物里没有补丁标记，改动可能没生效: " + ", ".join(bad)); sys.exit(1)
+          print("ok: 产物均包含 region-policy-disabled 标记")
+          PY
+
       - name: 生成发布说明
         shell: bash
         env:

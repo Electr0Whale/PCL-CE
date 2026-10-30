@@ -50,6 +50,9 @@ cron（每 2 小时）
 2. **审计**：全树扫描是否出现新的 `RegionPolicy.Evaluate(` / `RegionClassification.Mainland` 调用点，
    一旦上游把闸门搬到别处，构建会直接失败而不是悄悄产出一个仍然受限的 exe。
 
+构建完还会做一次**产物自检**：在 exe 里查找 UTF-16 标记 `region-policy-disabled`，
+查不到就判定补丁未生效并失败。
+
 ## 产物
 
 每个 release 附带：
@@ -73,5 +76,7 @@ dotnet publish "upstream/Plain Craft Launcher 2/Plain Craft Launcher 2.csproj" \
 ## 维护
 
 - 上游改了判定结构 → `strip_region_gate.py` 的 `audit()` 会让构建失败，按报错调整补丁位置即可。
-- 只想补历史版本 → 用 `tag` 输入逐个触发，或调大 `MAX_PER_RUN`。
+- 只想补历史版本 → 用 `tag` 输入逐个触发，或调大 `MAX_PER_RUN`（默认 5，只处理 `MIN_VERSION` 及之后的版本）。
+- GitHub 会在仓库 60 天无活动后暂停定时工作流：到 Actions 页面点一次 "Enable workflow"，
+  或手动跑一次即可恢复。
 - 上游代码版权归原作者，见上游 [LICENSE](https://github.com/PCL-Community/PCL-CE/blob/dev/LICENSE)。

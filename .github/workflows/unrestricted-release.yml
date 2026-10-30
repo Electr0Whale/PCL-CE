@@ -251,8 +251,9 @@ jobs:
           fi
 
           if gh release view "${TAG}" >/dev/null 2>&1; then
-            echo "release ${TAG} 已存在，覆盖上传产物"
+            echo "release ${TAG} 已存在，覆盖上传产物并刷新说明"
             gh release upload "${TAG}" dist/* --clobber
+            gh release edit "${TAG}" --notes-file notes.md
           else
             FLAGS=()
             if [ "${IS_PRE}" = "true" ]; then FLAGS+=(--prerelease); fi

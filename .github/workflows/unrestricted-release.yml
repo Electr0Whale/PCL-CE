@@ -1,0 +1,198 @@
+name: 无区域限制构建
+
+# 监测上游 PCL-Community/PCL-CE 的新 release：
+#   1. 找到还没构建过的 tag
+#   2. 拉取该 tag 的源码
+#   3. 应用最小化改动（scripts/strip_region_gate.py）
+#   4. 编译 x64 / ARM64 单文件 exe
+#   5. 在本仓库以同名 tag 发布 Release
+
+on:
+  schedule:
+    - cron: '23 */2 * * *'   # 每 2 小时检查一次（GitHub 的 cron 可能延迟几分钟）
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '指定上游 release tag（留空 = 自动扫描最新）'
+        required: false
+        default: ''
+      include_prerelease:
+        description: '同时处理 pre-release'
+        type: boolean
+        default: false
+      force:
+        description: '已发布过的 tag 也重新构建'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: unrestricted-release
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: PCL-Community/PCL-CE
+  GH_TOKEN: ${{ github.token }}
+  MIN_VERSION: 'v2.15.1'   # 区域限制自该版本引入，更早的 tag 跳过
+  MAX_PER_RUN: '5'         # 单次最多构建几个版本
+
+jobs:
+  plan:
+    name: 计算待构建版本
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      count: ${{ steps.plan.outputs.count }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 扫描上游 release
+        id: plan
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          INCLUDE_PRE: ${{ github.event.inputs.include_prerelease }}
+          FORCE: ${{ github.event.inputs.force }}
+        run: python3 scripts/plan_builds.py
+
+  build:
+    name: 构建 ${{ matrix.tag }}
+    needs: plan
+    if: needs.plan.outputs.count != '0'
+    runs-on: windows-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 .NET 10 SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: 拉取上游同版本源码
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "${{ matrix.tag }}" "https://github.com/${UPSTREAM}.git" upstream
+          echo "上游 commit: $(git -C upstream rev-parse HEAD)"
+          git -C upstream describe --tags --always
+
+      - name: 应用最小化改动
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/strip_region_gate.py upstream
+          echo '--- 改动内容 ---'
+          git -C upstream diff
+
+      - name: 编译 x64
+        shell: bash
+        run: |
+          set -euo pipefail
+          dotnet publish "upstream/Plain Craft Launcher 2/Plain Craft Launcher 2.csproj" \
+            -c Release -p:Platform=x64 -p:DeleteExistingFiles=true \
+            -o "$GITHUB_WORKSPACE/out/x64" --no-self-contained
+
+      - name: 编译 ARM64
+        shell: bash
+        run: |
+          set -euo pipefail
+          dotnet publish "upstream/Plain Craft Launcher 2/Plain Craft Launcher 2.csproj" \
+            -c Release -p:Platform=ARM64 -p:DeleteExistingFiles=true \
+            -o "$GITHUB_WORKSPACE/out/arm64" --no-self-contained
+
+      - name: 整理产物
+        shell: bash
+        env:
+          TAG: ${{ matrix.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp "out/x64/Plain Craft Launcher 2.exe"   "dist/PCL2_CE_${TAG}_x64_unrestricted.exe"
+          cp "out/arm64/Plain Craft Launcher 2.exe" "dist/PCL2_CE_${TAG}_ARM64_unrestricted.exe"
+          ( cd dist && sha256sum ./*.exe > SHA256SUMS.txt )
+          ls -lh dist
+          cat dist/SHA256SUMS.txt
+
+      - name: 生成发布说明
+        shell: bash
+        env:
+          TAG: ${{ matrix.tag }}
+        run: |
+          set -euo pipefail
+          cat > notes.md <<EOF
+          ## ${TAG} · 无区域限制构建
+
+          源码取自上游 [\`${UPSTREAM}\`](https://github.com/${UPSTREAM}/tree/${TAG}) 的 \`${TAG}\` tag，
+          仅做一处最小改动，其余与官方完全一致。
+
+          ### 改动
+
+          \`\`\`diff
+          - internal static RegionAssessment Assess() => RegionPolicy.Evaluate(RegionPolicy.ReadWindowsSignals());
+          + internal static RegionAssessment Assess() => new(RegionClassification.Other, "region-policy-disabled");
+          \`\`\`
+
+          上游自 2.15.1 起把「中国大陆区域」判定集中在 \`PCL.RestrictedFeaturePolicy\`，
+          15 处下载 / 安装 / 补全 / 启动前检查入口都经过它的 \`IsRestricted\` / \`Check\` / \`ThrowIfRestricted\`，
+          三者全部以 \`Assess()\` 的返回值为准。让 \`Assess()\` 恒定返回 \`Other\`，
+          所有入口同时放行，且不再弹提示、不再写拦截日志。
+
+          ### 产物
+
+          - \`PCL2_CE_${TAG}_x64_unrestricted.exe\` — 单文件，需 .NET 10 Desktop Runtime
+          - \`PCL2_CE_${TAG}_ARM64_unrestricted.exe\` — 单文件，需 .NET 10 Desktop Runtime
+          - \`SHA256SUMS.txt\`
+
+          ### 说明
+
+          - 与官方发布同规格：\`dotnet publish -c Release -p:Platform=<arch> --no-self-contained\`，单文件。
+          - 程序会在 exe 同级创建 \`PCL\` 数据目录，不会覆盖 \`%APPDATA%\PCLCE\` 里的既有配置。
+          - 仅供本地测试与研究使用；上游代码版权归原作者所有（见上游 LICENSE）。
+          EOF
+          cat notes.md
+
+      - name: 发布 Release
+        shell: bash
+        env:
+          TAG: ${{ matrix.tag }}
+          IS_PRE: ${{ matrix.prerelease }}
+        run: |
+          set -euo pipefail
+          if git ls-remote --tags origin "refs/tags/${TAG}" | grep -q .; then
+            echo "tag ${TAG} 已存在于本仓库"
+          else
+            git fetch --no-tags --depth=1 "https://github.com/${UPSTREAM}.git" "refs/tags/${TAG}:refs/tags/${TAG}"
+            git push origin "refs/tags/${TAG}"
+          fi
+
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            echo "release ${TAG} 已存在，覆盖上传产物"
+            gh release upload "${TAG}" dist/* --clobber
+          else
+            FLAGS=()
+            if [ "${IS_PRE}" = "true" ]; then FLAGS+=(--prerelease); fi
+            gh release create "${TAG}" dist/* \
+              --title "${TAG} · 无区域限制构建" \
+              --notes-file notes.md \
+              "${FLAGS[@]}"
+          fi
+          gh release view "${TAG}" --json tagName,url,assets --jq '.tagName + " " + .url'
+
+  report:
+    name: 汇总
+    needs: [plan, build]
+    if: always() && needs.plan.outputs.count != '0'
+    runs-on: ubuntu-latest
+    steps:
+      - name: 写入 job summary
+        run: |
+          echo "### 构建结果" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- 计划: \`${{ needs.plan.result }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- 构建: \`${{ needs.build.result }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- 版本: \`${{ needs.plan.outputs.matrix }}\`" >> "$GITHUB_STEP_SUMMARY"

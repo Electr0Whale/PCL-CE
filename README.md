@@ -53,6 +53,35 @@ cron（每 2 小时）
 构建完还会做一次**产物自检**：在 exe 里查找 UTF-16 标记 `region-policy-disabled`，
 查不到就判定补丁未生效并失败。
 
+## 构建密钥（重要）
+
+上游把密钥**编译期**写进 `EnvironmentInterop.SecretDictionary`：只有构建时存在
+`PCL_WRITE_SECRET` 环境变量，source generator 才会把 `PCL_*` 变量嵌进程序。
+Release 构建里 `Secrets.GetSecret(..., readEnvDebugOnly: true)` **不读**运行时环境变量，
+所以缺什么只能重新编译，不能靠设置环境变量补救。
+
+缺 `PCL_MS_CLIENT_ID` 的典型表现（启动即失败）：
+
+```
+System.InvalidOperationException: Microsoft OAuth client id is not configured.
+  at PCL.Core.Minecraft.Profile.Authentication.MicrosoftProvider..ctor()
+```
+
+在仓库 Settings → Secrets and variables → Actions 配置（均可选，缺了只是对应功能不可用）：
+
+| Secret | 作用 | 缺失后果 |
+| --- | --- | --- |
+| `PCL_MS_CLIENT_ID` | 微软 OAuth 公共客户端 ID | 正版验证不可用（本仓库已配置） |
+| `PCL_CURSEFORGE_API_KEY` | CurseForge API Key | CurseForge 源下载 403 |
+| `PCL_SENTRY_DSN` | 遥测 | 无影响 |
+| `PCL_NAID_CLIENT_ID` / `PCL_NAID_CLIENT_SECRET` | Natayark 账号 | 该登录方式不可用 |
+| `PCL_LINK_SERVER_ROOT` / `PCL_LOBBY_DEFAULT_SECRET` | 联机大厅 | 联机大厅不可用 |
+
+`PCL_MS_CLIENT_ID` 是公共客户端 ID（不是密钥，设备码流程不需要 client secret）。
+想用自己的：Azure Portal → 应用注册 → 账户类型选「个人 Microsoft 账户」→
+身份验证里开启「允许公共客户端流」→ scope 用 `XboxLive.signin offline_access`，
+拿到 Application (client) ID 后替换同名 secret 即可。
+
 ## 产物
 
 每个 release 附带：

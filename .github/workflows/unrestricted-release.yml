@@ -78,7 +78,9 @@ jobs:
         run: |
           set -euo pipefail
           git clone --depth 1 --branch "${{ matrix.tag }}" "https://github.com/${UPSTREAM}.git" upstream
-          echo "上游 commit: $(git -C upstream rev-parse HEAD)"
+          sha="$(git -C upstream rev-parse HEAD)"
+          echo "UPSTREAM_SHA=$sha" >> "$GITHUB_ENV"
+          echo "上游 commit: $sha"
           git -C upstream describe --tags --always
 
       - name: 应用最小化改动
@@ -89,16 +91,45 @@ jobs:
           echo '--- 改动内容 ---'
           git -C upstream diff
 
+      # 上游用 PCL_WRITE_SECRET + PCL_* 环境变量把密钥编进 EnvironmentInterop.SecretDictionary。
+      # Release 构建里 Secrets.GetSecret(..., readEnvDebugOnly: true) 不会读运行时环境变量，
+      # 所以这些值只能在编译期注入；缺 PCL_MS_CLIENT_ID 就会「Microsoft OAuth client id is not configured」。
       - name: 编译 x64
         shell: bash
+        env:
+          PCL_WRITE_SECRET: '1'
+          PCL_MS_CLIENT_ID: ${{ secrets.PCL_MS_CLIENT_ID }}
+          PCL_CURSEFORGE_API_KEY: ${{ secrets.PCL_CURSEFORGE_API_KEY }}
+          PCL_SENTRY_DSN: ${{ secrets.PCL_SENTRY_DSN }}
+          PCL_NAID_CLIENT_ID: ${{ secrets.PCL_NAID_CLIENT_ID }}
+          PCL_NAID_CLIENT_SECRET: ${{ secrets.PCL_NAID_CLIENT_SECRET }}
+          PCL_LINK_SERVER_ROOT: ${{ secrets.PCL_LINK_SERVER_ROOT }}
+          PCL_LOBBY_DEFAULT_SECRET: ${{ secrets.PCL_LOBBY_DEFAULT_SECRET }}
+          PCL_GITHUB_SHA: ${{ env.UPSTREAM_SHA }}
         run: |
           set -euo pipefail
+          if [ -z "${PCL_MS_CLIENT_ID}" ]; then
+            echo "::warning::仓库未配置 secret PCL_MS_CLIENT_ID，本次产物的微软正版登录不可用"
+          fi
+          if [ -z "${PCL_CURSEFORGE_API_KEY}" ]; then
+            echo "::warning::仓库未配置 secret PCL_CURSEFORGE_API_KEY，CurseForge 下载可能返回 403"
+          fi
           dotnet publish "upstream/Plain Craft Launcher 2/Plain Craft Launcher 2.csproj" \
             -c Release -p:Platform=x64 -p:DeleteExistingFiles=true \
             -o "$GITHUB_WORKSPACE/out/x64" --no-self-contained
 
       - name: 编译 ARM64
         shell: bash
+        env:
+          PCL_WRITE_SECRET: '1'
+          PCL_MS_CLIENT_ID: ${{ secrets.PCL_MS_CLIENT_ID }}
+          PCL_CURSEFORGE_API_KEY: ${{ secrets.PCL_CURSEFORGE_API_KEY }}
+          PCL_SENTRY_DSN: ${{ secrets.PCL_SENTRY_DSN }}
+          PCL_NAID_CLIENT_ID: ${{ secrets.PCL_NAID_CLIENT_ID }}
+          PCL_NAID_CLIENT_SECRET: ${{ secrets.PCL_NAID_CLIENT_SECRET }}
+          PCL_LINK_SERVER_ROOT: ${{ secrets.PCL_LINK_SERVER_ROOT }}
+          PCL_LOBBY_DEFAULT_SECRET: ${{ secrets.PCL_LOBBY_DEFAULT_SECRET }}
+          PCL_GITHUB_SHA: ${{ env.UPSTREAM_SHA }}
         run: |
           set -euo pipefail
           dotnet publish "upstream/Plain Craft Launcher 2/Plain Craft Launcher 2.csproj" \
@@ -122,10 +153,11 @@ jobs:
         shell: bash
         env:
           PYTHONIOENCODING: utf-8
+          MS_CLIENT_ID: ${{ secrets.PCL_MS_CLIENT_ID }}
         run: |
           set -euo pipefail
           python - <<'PY'
-          import pathlib, sys
+          import os, pathlib, sys
           sys.stdout.reconfigure(encoding="utf-8", errors="replace")
           marker = "region-policy-disabled".encode("utf-16-le")
           exes = sorted(pathlib.Path("dist").glob("*.exe"))
@@ -136,19 +168,41 @@ jobs:
           if bad:
               print("::error::产物里没有补丁标记，改动可能没生效: " + ", ".join(bad)); sys.exit(1)
           print("ok: 产物均包含 region-policy-disabled 标记")
+
+          cid = os.environ.get("MS_CLIENT_ID", "").strip()
+          if cid:
+              baked = cid.encode("utf-16-le")
+              missing = [p.name for p in exes if baked not in p.read_bytes()]
+              if missing:
+                  print("::error::secret 已配置但产物里没有内嵌 client id，微软登录仍会失败: " + ", ".join(missing)); sys.exit(1)
+              print("ok: 产物已内嵌 PCL_MS_CLIENT_ID")
+          else:
+              print("::warning::未配置 PCL_MS_CLIENT_ID，产物不支持微软正版登录")
           PY
 
       - name: 生成发布说明
         shell: bash
         env:
           TAG: ${{ matrix.tag }}
+          MS_CLIENT_ID: ${{ secrets.PCL_MS_CLIENT_ID }}
+          CF_KEY: ${{ secrets.PCL_CURSEFORGE_API_KEY }}
         run: |
           set -euo pipefail
+          if [ -n "${MS_CLIENT_ID}" ]; then
+            LOGIN_LINE="微软正版登录可用（构建时已内嵌 client id）"
+          else
+            LOGIN_LINE="⚠ 本构建**未**内嵌微软 client id：正版登录会报 \`Microsoft OAuth client id is not configured\`，请改用「离线验证」账号"
+          fi
+          if [ -n "${CF_KEY}" ]; then
+            CF_LINE="CurseForge 下载可用（已内嵌 API Key）"
+          else
+            CF_LINE="⚠ 未内嵌 CurseForge API Key，CurseForge 源可能返回 403"
+          fi
           cat > notes.md <<EOF
           ## ${TAG} · 无区域限制构建
 
           源码取自上游 [\`${UPSTREAM}\`](https://github.com/${UPSTREAM}/tree/${TAG}) 的 \`${TAG}\` tag，
-          仅做一处最小改动，其余与官方完全一致。
+          仅做一处最小改动，其余与官方一致。
 
           ### 改动
 
@@ -161,6 +215,12 @@ jobs:
           15 处下载 / 安装 / 补全 / 启动前检查入口都经过它的 \`IsRestricted\` / \`Check\` / \`ThrowIfRestricted\`，
           三者全部以 \`Assess()\` 的返回值为准。让 \`Assess()\` 恒定返回 \`Other\`，
           所有入口同时放行，且不再弹提示、不再写拦截日志。
+
+          ### 登录与下载
+
+          - ${LOGIN_LINE}
+          - ${CF_LINE}
+          - 需要正版验证的服务器必须用「正版验证」账号；纯本地游玩用「离线验证」即可。
 
           ### 产物
 
